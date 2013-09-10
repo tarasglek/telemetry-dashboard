@@ -6,10 +6,16 @@ except ImportError:
 import sys
 import telemetryutils
 import jydoop
+import __builtin__
 
+verbose = False
+
+SPECS = "scripts/histogram_specs.json"
 histogram_specs = json.loads(
-    jydoop.getResource("scripts/histogram_specs.json"))
+    jydoop.getResource(SPECS))
 
+# hack, get an arbiratry histogram with 1..30000 exponential histogram dimensions
+SIMPLE_MEASURES_ = histogram_specs['HTTP_SUB_OPEN_TO_FIRST_RECEIVED']
 
 def map(uid, line, context):
     global histogram_specs
@@ -42,16 +48,14 @@ def map(uid, line, context):
         osVersion = osVersion[:3]
 
     path = (buildDate, reason, appName, OS, osVersion, arch)
-    histograms = payload.get('histograms', None)
-    if histograms is None:
-        msg = "histograms is None in map"
-        print >> sys.stderr, msg
-        return
+    histograms = payload.get('histograms', {})
+
     for h_name, h_values in histograms.iteritems():
         bucket2index = histogram_specs.get(h_name, None)
         if bucket2index is None:
-            msg = "bucket2index is None in map"
-            print >> sys.stderr, msg
+            if verbose:
+                msg = "%s definition not found in %s" % (h_name, SPECS)
+                print >> sys.stderr, msg
             continue
         else:
             bucket2index = bucket2index[0]
@@ -76,8 +80,9 @@ def map(uid, line, context):
                 break
             outarray[index] = value
         if error:
-            msg = "index is None in map"
-            print >> sys.stderr, msg
+            if verbose:
+                msg = "Invalid bucket '%s' in %s" % (bucket, h_name)
+                print >> sys.stderr, msg
             continue
 
         histogram_sum = h_values.get('sum', None)
@@ -87,22 +92,37 @@ def map(uid, line, context):
             continue
         outarray[-2] = histogram_sum
         outarray[-1] = 1        # count
-        try:
-            context.write((channel, appVersion, h_name), {path: outarray})
-        except TypeError:
-            dict_locations = [p for p, t in enumerate(path) if type(t) is dict]
-            if dict_locations:
-                field_names = ["buildDate", "reason", "appName", "OS",
-                               "osVersion", "arch"]
-                dict_field_names = [field_names[i] for i in dict_locations]
-                msg = ("unable to hash the following `path` fields: %s" %
-                       (' '.join(dict_field_names)))
-            else:
-                msg = "TypeError when writing map output."
-            print >> sys.stderr, msg
-            return
+        context.write((channel, appVersion, h_name), {path: outarray})
+        
+    rawSimpleMeasurements = payload.get('simpleMeasurements', {})
+    simpleMeasurements = {}
+    # flatten subdicts
+    for sm_name, sm_value in rawSimpleMeasurements.iteritems():
+        if type(sm_value) == dict:
+            for sub_name, sub_value in sm_value.iteritems():
+                simpleMeasurements[sm_name + "_" + sub_name] = sub_value
+        else:
+            simpleMeasurements[sm_name] = sm_value
 
+    for sm_name, sm_value in simpleMeasurements.iteritems():
+        if type(sm_value) != int:
+            if verbose:
+                print >> sys.stderr, ("%s is not a value type for simpleMeasurements.%s" % 
+                                  (type(sm_value), sm_name))
+            continue
+        buckets = SIMPLE_MEASURES_[1]
+        
+        # most buckets contain 0s, so preallocation is a significant win
+        outarray = [0] * (len(buckets) + 2)
+        for i in reversed(range(0, len(buckets))):
+            if sm_value >= buckets[i]:
+                outarray[i] = 1
+                break
 
+        outarray[-2] = sm_value # sum
+        outarray[-1] = 1        # count
+        context.write((channel, appVersion, "SIMPLE_MEASURES_" + sm_name.upper()), {path: outarray})
+        
 def commonCombine(values):
     out = {}
     for d in values:
@@ -134,9 +154,14 @@ def reduce(key, values, context):
             return
         out_values["/".join(filter_path)] = histogram
     h_name = key[2]
-    # histogram_specs lookup below is guranteed to succeed, because of mapper
+    
+    if h_name[0:16] == "SIMPLE_MEASURES_":
+        buckets = SIMPLE_MEASURES_;
+    else:
+        # histogram_specs lookup below is guranteed to succeed, because of mapper
+        buckets = histogram_specs.get(h_name)[1]
     final_out = {
-        'buckets': histogram_specs.get(h_name)[1],
+        'buckets': buckets,
         'values': out_values
     }
     context.write("/".join(key), json.dumps(final_out))
